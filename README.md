@@ -30,23 +30,31 @@ To use this API, you need two tokens from your DeepSeek account:
 
 ### How to store tokens
 
-Create a `tokens` file in the project root with two lines:
+Create a `tokens` file in the project root with two or three lines:
 
 ```
 <ds_session_id>
 <authorization_token>
+<optional raw cookie string>
 ```
 
 Example `tokens` file:
 ```
 35******************************775
 Bearer sm*************************************************oT6
+dsid=…; ds_cookie_preference=…; aws-waf-token=…
 ```
+
+The third line is optional and takes the whole `Cookie` header value from the
+browser request. It is only needed when the plain `ds_session_id` cookie is not
+enough (for example when a WAF cookie is also required).
 
 Alternatively, set environment variables:
 ```bash
 export DS_SESSION_ID="your_session_id"
 export AUTHORIZATION_TOKEN="Bearer your_token"
+export DS_COOKIES="ds_session_id=…; aws-waf-token=…"   # optional
+export DS_DEVICE_ID="stable-uuid"                      # optional
 ```
 
 ## Usage
@@ -87,6 +95,64 @@ curl http://localhost:8000/v1/chat/completions \
 - `deepseek-r1` - Default model with extended thinking
 - `deepseek-v4` - Expert model without extended thinking
 - `deepseek-r4` - Expert model with extended thinking
+
+Unknown model ids are rejected with an OpenAI-style `404 model_not_found`.
+
+Two non-standard request fields are supported:
+
+```json
+{"model": "deepseek-v3", "search_enabled": true, "messages": ["…"]}
+```
+
+- `search_enabled` - turns on DeepSeek's search; citations come back in the
+  response object (`citation`), and as `search` deltas when streaming.
+- Reasoning models report their chain of thought as `reasoning_content` in the
+  assistant message (and as `reasoning_content` deltas when streaming).
+
+## Running tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The suite runs offline: stream-parsing tests are driven by real captured SSE
+traffic under `tests/fixtures/`, and the HTTP layer is tested against a stubbed
+upstream. Live end-to-end tests are opt-in because they consume turns on the
+account behind `tokens`:
+
+```bash
+DS_LIVE=1 python3 -m unittest discover -s tests -v
+```
+
+## Protocol notes
+
+The request/response contract was checked against captured traffic from the
+real web client (`x-client-version: 2.5.0`). What matters:
+
+- **`model_type`** is the only model selector on the wire. Observed values are
+  `"default"` and `null`; the web client sends **`null` on reasoning turns**.
+  `deepseek-v3`/`deepseek-r1` map onto those two. `"expert"` (the `v4`/`r4`
+  names) is accepted but is not backed by captured traffic.
+- **The SSE stream is a JSON-patch protocol over `response/fragments`**, and each
+  fragment has a `type` of `THINK` or `RESPONSE`. Content must be accumulated per
+  fragment; the first fragment's text arrives in the initial object, not as a
+  delta. `close` terminates the stream (there is no `finish` event).
+- **`chat_session/create`** returns the id at `data.biz_data.chat_session.id`.
+- **PoW** (`create_pow_challenge` → `x-ds-pow-response`) uses the `DeepSeekHashV1`
+  algorithm served as `sha3_wasm_bg.wasm`; the bundled solver is that artifact.
+- **`Referer`** must be spelled exactly that way (`/a/chat/s/<chat_session_id>`).
+- `x-app-version` and `x-debug-*model-channel` are no longer sent by the real
+  client and have been dropped.
+
+### Known limitation: `40300 MISSING_HEADER`
+
+The web client sometimes attaches an extra token pair (`x-hif-leim` /
+`x-hif-dliq`), minted by `hif-leim.deepseek.com/query` with a 600 s TTL and sent
+on a **subset** of sessions — other sessions complete without them. Those tokens
+are deliberately **not** implemented here. When the service decides it wants
+them, the completion call returns HTTP 200 with a JSON body
+`{"code":40300,"msg":"MISSING_HEADER"}`. That is surfaced as a clean error
+rather than a crash; retrying in a fresh session usually works.
 
 ### Python API
 
